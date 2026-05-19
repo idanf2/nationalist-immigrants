@@ -1,0 +1,386 @@
+---
+title: "Three Pillars: Descriptive Figures"
+author: "Idan Franco"
+output: html_document
+---
+
+```{r}
+rm(list = ls())
+
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+library(scales)
+library(forcats)
+library(purrr)
+library(haven)
+
+cmps16_path <- file.path("data", "cmps_2016.rda")
+cmps20_path <- file.path("data", "cmps_2020.rda")
+gss_path    <- file.path("data", "gss_1972_2024.sav")
+
+fig_dir  <- "figures"
+csv_path <- file.path(fig_dir, "three_pillars_clean.csv")
+if (!dir.exists(fig_dir)) dir.create(fig_dir, recursive = TRUE)
+
+theme_paper <- function(base_size = 11) {
+  theme_minimal(base_size = base_size) +
+    theme(plot.title    = element_text(face = "bold", size = base_size + 1),
+          plot.subtitle = element_text(color = "grey30", size = base_size - 1),
+          plot.caption  = element_text(color = "grey40", size = base_size - 3,
+                                       hjust = 0),
+          legend.position  = "bottom",
+          strip.text       = element_text(face = "bold"),
+          panel.grid.minor = element_blank())
+}
+
+pal_two <- c("Non-White immigrants" = "#1f78b4",
+             "Non-White natives"    = "#e31a1c")
+
+save_fig <- function(p, name, w = 9, h = 5) {
+  if (is.null(p)) return(invisible(NULL))
+  ggsave(filename = file.path(fig_dir, paste0(name, ".png")),
+         plot = p, width = w, height = h, dpi = 300, bg = "white")
+  message("[ok] ", name)
+}
+
+load_rda <- function(path) {
+  e <- new.env(); load(path, envir = e); get(ls(e)[1], envir = e)
+}
+
+to_num <- function(x) {
+  if (inherits(x, c("haven_labelled","labelled"))) {
+    return(as.numeric(haven::zap_labels(x)))
+  }
+  if (is.factor(x)) {
+    lvls <- levels(x)
+    n1 <- suppressWarnings(as.numeric(lvls))
+    if (sum(!is.na(n1)) >= length(lvls) * 0.8) {
+      return(as.numeric(as.character(x)))
+    }
+    m  <- regmatches(lvls, regexpr("^\\s*\\(?\\s*(-?\\d+)", lvls))
+    n2 <- suppressWarnings(as.numeric(gsub("[^-0-9]", "", m)))
+    if (length(n2) == length(lvls) &&
+        sum(!is.na(n2)) >= length(lvls) * 0.8) {
+      return(n2[as.integer(x)])
+    }
+    return(as.integer(x))
+  }
+  suppressWarnings(as.numeric(x))
+}
+
+coerce_cols <- function(data, cols) {
+  for (cc in intersect(cols, names(data))) data[[cc]] <- to_num(data[[cc]])
+  data
+}
+
+prop_by <- function(data, group, var, w = "weight") {
+  if (nrow(data) == 0 || !all(c(group, var, w) %in% names(data))) {
+    return(tibble(group = character(), mean = numeric(), n = integer()))
+  }
+  d <- data %>%
+    select(all_of(c(group, var, w))) %>%
+    rename(.g = !!group, .v = !!var, .w = !!w)
+  d$.v <- suppressWarnings(as.numeric(d$.v))
+  d$.w <- suppressWarnings(as.numeric(d$.w))
+  d <- d %>% filter(!is.na(.g), !is.na(.v))
+  if (nrow(d) == 0) {
+    return(tibble(group = character(), mean = numeric(), n = integer()))
+  }
+  d %>% group_by(.g) %>%
+    summarise(mean = sum(.v * .w, na.rm = TRUE) / sum(.w, na.rm = TRUE),
+              n    = sum(!is.na(.v)),
+              .groups = "drop") %>%
+    rename(group = .g)
+}
+
+battery_table <- function(data, group, vars, var_labels, w = "weight") {
+  map_dfr(seq_along(vars), function(i) {
+    pt <- prop_by(data, group, vars[i], w)
+    if (nrow(pt) == 0) return(NULL)
+    pt %>% mutate(item = var_labels[i], variable = vars[i])
+  })
+}
+
+add_n <- function(df) {
+  df %>% mutate(lbl = sprintf("%s (n=%s)",
+                              scales::percent(mean, accuracy = 1),
+                              scales::comma(n)))
+}
+
+cmps16 <- load_rda(cmps16_path)
+cmps20 <- load_rda(cmps20_path)
+gss    <- read_sav(gss_path)
+
+names(cmps16) <- toupper(names(cmps16))
+names(cmps20) <- toupper(names(cmps20))
+names(gss)    <- toupper(names(gss))
+
+cmps16 <- coerce_cols(cmps16,
+  c("S7","ETHNIC_QUOTA","C14","C251","C280","WEIGHT"))
+cmps20 <- coerce_cols(cmps20,
+  c("S7","S2_RACE_PRIME","Q14","Q627","Q281R2","Q281R3","Q281R4","WEIGHT"))
+gss <- coerce_cols(gss,
+  c("YEAR","BORN","RACECEN1","HISPANIC","PRES16","PRES20",
+    "AMBETTER","AMCITIZN","PROUDDEM","PROUDHIS",
+    "DISRSPCT","POORSERV","NOTSMART","AFRAIDOF","THREATEN","WTSSPS"))
+
+cmps16 <- cmps16 %>%
+  mutate(
+    immigrant = case_when(S7 == 2 ~ "Immigrants",
+                          S7 == 1 ~ "Natives",
+                          TRUE    ~ NA_character_),
+    nonwhite  = ETHNIC_QUOTA != 1,
+    compare_nw = case_when(
+      !is.na(immigrant) & nonwhite & immigrant == "Immigrants" ~ "Non-White immigrants",
+      !is.na(immigrant) & nonwhite & immigrant == "Natives"    ~ "Non-White natives",
+      TRUE ~ NA_character_),
+    discrim_ever  = ifelse(C251 == 1, 1, ifelse(C251 == 2, 0, NA)),
+    police_unfair = ifelse(C280 %in% 1:2, 1, ifelse(C280 == 3, 0, NA)),
+    vote_trump    = case_when(C14 == 2 ~ 1,
+                              C14 %in% c(1,3,4,5) ~ 0,
+                              TRUE ~ NA_real_),
+    weight = WEIGHT
+  )
+
+cmps20 <- cmps20 %>%
+  mutate(
+    immigrant = case_when(S7 == 2 ~ "Immigrants",
+                          S7 == 1 ~ "Natives",
+                          TRUE    ~ NA_character_),
+    nonwhite  = S2_RACE_PRIME != 1,
+    compare_nw = case_when(
+      !is.na(immigrant) & nonwhite & immigrant == "Immigrants" ~ "Non-White immigrants",
+      !is.na(immigrant) & nonwhite & immigrant == "Natives"    ~ "Non-White natives",
+      TRUE ~ NA_character_),
+    discrim_ever   = ifelse(Q627 == 1, 1, ifelse(Q627 == 2, 0, NA)),
+    discrim_police = ifelse(Q281R2 == 1, 1, ifelse(Q281R2 == 0, 0, NA)),
+    discrim_immig  = ifelse(Q281R3 == 1, 1, ifelse(Q281R3 == 0, 0, NA)),
+    discrim_work   = ifelse(Q281R4 == 1, 1, ifelse(Q281R4 == 0, 0, NA)),
+    vote_trump = case_when(Q14 == 1 ~ 1,
+                           Q14 %in% c(2,3,4,5,6) ~ 0,
+                           TRUE ~ NA_real_),
+    weight = WEIGHT
+  )
+
+gss <- gss %>%
+  mutate(
+    immigrant = case_when(BORN == 2 ~ "Immigrants",
+                          BORN == 1 ~ "Natives",
+                          TRUE      ~ NA_character_),
+    nonwhite  = (RACECEN1 != 1) | (!is.na(HISPANIC) & HISPANIC != 1),
+    compare_nw = case_when(
+      !is.na(immigrant) & nonwhite & immigrant == "Immigrants" ~ "Non-White immigrants",
+      !is.na(immigrant) & nonwhite & immigrant == "Natives"    ~ "Non-White natives",
+      TRUE ~ NA_character_),
+
+    disc_disrspct = ifelse(DISRSPCT %in% 1:4, 1,
+                    ifelse(DISRSPCT %in% 5:6, 0, NA)),
+    disc_service  = ifelse(POORSERV %in% 1:4, 1,
+                    ifelse(POORSERV %in% 5:6, 0, NA)),
+    disc_notsmart = ifelse(NOTSMART %in% 1:4, 1,
+                    ifelse(NOTSMART %in% 5:6, 0, NA)),
+    disc_afraidof = ifelse(AFRAIDOF %in% 1:4, 1,
+                    ifelse(AFRAIDOF %in% 5:6, 0, NA)),
+    disc_threaten = ifelse(THREATEN %in% 1:4, 1,
+                    ifelse(THREATEN %in% 5:6, 0, NA)),
+
+    nat_proud_dem = ifelse(PROUDDEM %in% 1:2, 1,
+                    ifelse(PROUDDEM %in% 3:4, 0, NA)),
+    nat_proud_his = ifelse(PROUDHIS %in% 1:2, 1,
+                    ifelse(PROUDHIS %in% 3:4, 0, NA)),
+    nat_better    = ifelse(AMBETTER %in% 1:2, 1,
+                    ifelse(AMBETTER %in% 3:5, 0, NA)),
+    nat_rather_us = ifelse(AMCITIZN %in% 1:2, 1,
+                    ifelse(AMCITIZN %in% 3:5, 0, NA)),
+
+    vote_trump16 = case_when(PRES16 == 2 ~ 1,
+                             PRES16 %in% c(1,3,4) ~ 0,
+                             TRUE ~ NA_real_),
+    vote_trump20 = case_when(PRES20 == 2 ~ 1,
+                             PRES20 %in% c(1,3,4) ~ 0,
+                             TRUE ~ NA_real_),
+
+    weight = WTSSPS
+  )
+
+disc_cmps <- bind_rows(
+  prop_by(filter(cmps16, !is.na(compare_nw)), "compare_nw", "discrim_ever") %>%
+    mutate(item = "Ever discriminated", source = "CMPS 2016"),
+  prop_by(filter(cmps20, !is.na(compare_nw)), "compare_nw", "discrim_ever") %>%
+    mutate(item = "Ever discriminated", source = "CMPS 2020"),
+  prop_by(filter(cmps16, !is.na(compare_nw)), "compare_nw", "police_unfair") %>%
+    mutate(item = "Police mistreatment", source = "CMPS 2016"),
+  prop_by(filter(cmps20, !is.na(compare_nw)), "compare_nw", "discrim_police") %>%
+    mutate(item = "Police discrimination", source = "CMPS 2020"),
+  prop_by(filter(cmps20, !is.na(compare_nw)), "compare_nw", "discrim_immig") %>%
+    mutate(item = "Immigration officer discrim.", source = "CMPS 2020"),
+  prop_by(filter(cmps20, !is.na(compare_nw)), "compare_nw", "discrim_work") %>%
+    mutate(item = "Workplace discrim.", source = "CMPS 2020")
+) %>% add_n()
+
+p <- ggplot(disc_cmps, aes(x = mean, y = item, fill = group)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.65) +
+  geom_text(aes(label = lbl, x = mean),
+            position = position_dodge(width = 0.75),
+            hjust = -0.05, size = 2.7, color = "grey20") +
+  facet_wrap(~ source, scales = "free_y", ncol = 1) +
+  scale_x_continuous(labels = percent_format(accuracy = 1),
+                     expand = expansion(mult = c(0, 0.30))) +
+  scale_fill_manual(values = pal_two, name = NULL) +
+  labs(title = "PILLAR 1: Discrimination experiences (CMPS)",
+       x = NULL, y = NULL,
+       caption = "Source: CMPS 2016 + 2020. Weighted.") +
+  theme_paper()
+save_fig(p, "P1_discrimination_cmps", w = 11, h = 8)
+
+gss_disc_vars <- c("disc_disrspct","disc_service","disc_notsmart",
+                   "disc_afraidof","disc_threaten")
+gss_disc_labs <- c("Treated with less respect",
+                   "Worse service",
+                   "Treated as not smart",
+                   "People act afraid",
+                   "Threatened or harassed")
+
+gss_disc_years <- gss %>% group_by(YEAR) %>%
+  summarise(any_disc = any(!is.na(disc_disrspct)), .groups = "drop") %>%
+  filter(any_disc) %>% pull(YEAR)
+
+disc_gss <- map_dfr(gss_disc_years, function(yy) {
+  sub <- gss %>% filter(YEAR == yy, !is.na(compare_nw))
+  if (nrow(sub) == 0) return(NULL)
+  battery_table(sub, "compare_nw", gss_disc_vars, gss_disc_labs) %>%
+    mutate(wave = paste0("GSS ", yy))
+})
+
+if (nrow(disc_gss) > 0) {
+  disc_gss <- disc_gss %>%
+    mutate(item = factor(item, levels = rev(gss_disc_labs)),
+           wave = factor(wave, levels = paste0("GSS ", sort(gss_disc_years)))) %>%
+    add_n()
+
+  p <- ggplot(disc_gss, aes(x = mean, y = item, fill = group)) +
+    geom_col(position = position_dodge(width = 0.75), width = 0.65) +
+    geom_text(aes(label = lbl, x = mean),
+              position = position_dodge(width = 0.75),
+              hjust = -0.05, size = 2.5, color = "grey20") +
+    facet_wrap(~ wave, ncol = 2) +
+    scale_x_continuous(labels = percent_format(accuracy = 1),
+                       expand = expansion(mult = c(0, 0.35))) +
+    scale_fill_manual(values = pal_two, name = NULL) +
+    labs(title = "PILLAR 1: Everyday discrimination (GSS)",
+         subtitle = "% experiencing each form 'a few times a year' or more often",
+         x = NULL, y = NULL,
+         caption = "Source: GSS everyday discrimination battery. Weighted.") +
+    theme_paper()
+  save_fig(p, "P1_discrimination_gss",
+           w = 13, h = max(7, 3 * length(gss_disc_years)))
+}
+
+pride_vars <- c("nat_proud_dem","nat_proud_his","nat_better","nat_rather_us")
+pride_labs <- c("Proud of democracy",
+                "Proud of U.S. history",
+                "U.S. is a better country",
+                "Rather be U.S. citizen")
+
+pride_years <- gss %>% group_by(YEAR) %>%
+  summarise(any_pride = any(!is.na(nat_proud_dem)), .groups = "drop") %>%
+  filter(any_pride) %>% pull(YEAR)
+
+pride_gss <- map_dfr(pride_years, function(yy) {
+  sub <- gss %>% filter(YEAR == yy, !is.na(compare_nw))
+  if (nrow(sub) == 0) return(NULL)
+  battery_table(sub, "compare_nw", pride_vars, pride_labs) %>%
+    mutate(wave = paste0("GSS ", yy))
+})
+
+if (nrow(pride_gss) > 0) {
+  pride_gss <- pride_gss %>%
+    mutate(item = factor(item, levels = rev(pride_labs)),
+           wave = factor(wave, levels = paste0("GSS ", sort(pride_years)))) %>%
+    add_n()
+
+  p <- ggplot(pride_gss, aes(x = mean, y = item, fill = group)) +
+    geom_col(position = position_dodge(width = 0.75), width = 0.65) +
+    geom_text(aes(label = lbl, x = mean),
+              position = position_dodge(width = 0.75),
+              hjust = -0.05, size = 2.5, color = "grey20") +
+    facet_wrap(~ wave, ncol = 1) +
+    scale_x_continuous(labels = percent_format(accuracy = 1),
+                       expand = expansion(mult = c(0, 0.35))) +
+    scale_fill_manual(values = pal_two, name = NULL) +
+    labs(title = "PILLAR 2: National pride (GSS)",
+         subtitle = "% endorsing each item ('agree' / 'proud' or stronger)",
+         x = NULL, y = NULL,
+         caption = "Source: GSS ISSP National Identity battery. Weighted.") +
+    theme_paper()
+  save_fig(p, "P2_pride_gss",
+           w = 11, h = max(6, 3.2 * length(pride_years)))
+}
+
+trump_cmps <- bind_rows(
+  prop_by(filter(cmps16, !is.na(compare_nw)), "compare_nw", "vote_trump") %>%
+    mutate(source = "CMPS 2016"),
+  prop_by(filter(cmps20, !is.na(compare_nw)), "compare_nw", "vote_trump") %>%
+    mutate(source = "CMPS 2020")
+) %>% add_n()
+
+p <- ggplot(trump_cmps, aes(x = source, y = mean, fill = group)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.65) +
+  geom_text(aes(label = lbl, y = mean),
+            position = position_dodge(width = 0.75),
+            vjust = -0.5, size = 3, color = "grey20") +
+  scale_y_continuous(labels = percent_format(accuracy = 1),
+                     expand = expansion(mult = c(0, 0.20))) +
+  scale_fill_manual(values = pal_two, name = NULL) +
+  labs(title = "PILLAR 3: Trump vote (CMPS)",
+       x = NULL, y = NULL,
+       caption = "Source: CMPS 2016 (C14) + CMPS 2020 (Q14). Weighted.") +
+  theme_paper()
+save_fig(p, "P3_trump_cmps", w = 9, h = 5)
+
+trump_gss <- map_dfr(c(2022, 2024), function(yy) {
+  sub <- gss %>% filter(YEAR == yy, !is.na(compare_nw))
+  if (nrow(sub) == 0) return(NULL)
+  bind_rows(
+    prop_by(sub, "compare_nw", "vote_trump16") %>%
+      mutate(election = "2016", gss_year = paste0("GSS ", yy)),
+    prop_by(sub, "compare_nw", "vote_trump20") %>%
+      mutate(election = "2020", gss_year = paste0("GSS ", yy))
+  )
+}) %>% add_n()
+
+if (nrow(trump_gss) > 0) {
+  p <- ggplot(trump_gss, aes(x = election, y = mean, fill = group)) +
+    geom_col(position = position_dodge(width = 0.75), width = 0.65) +
+    geom_text(aes(label = lbl, y = mean),
+              position = position_dodge(width = 0.75),
+              vjust = -0.5, size = 2.7, color = "grey20") +
+    facet_wrap(~ gss_year) +
+    scale_y_continuous(labels = percent_format(accuracy = 1),
+                       expand = expansion(mult = c(0, 0.20))) +
+    scale_fill_manual(values = pal_two, name = NULL) +
+    labs(title = "PILLAR 3: Trump vote (GSS retrospective)",
+         x = "Election", y = NULL,
+         caption = "Source: GSS PRES16 / PRES20. Weighted.") +
+    theme_paper()
+  save_fig(p, "P3_trump_gss", w = 11, h = 5)
+}
+
+all_results <- bind_rows(
+  disc_cmps  %>% mutate(figure = "P1_cmps"),
+  disc_gss   %>% mutate(figure = "P1_gss"),
+  pride_gss  %>% mutate(figure = "P2_gss"),
+  trump_cmps %>% mutate(figure = "P3_cmps"),
+  trump_gss  %>% mutate(figure = "P3_gss")
+)
+
+write.csv(all_results, csv_path, row.names = FALSE,
+          fileEncoding = "UTF-8", na = "")
+
+message("\nWrote ", nrow(all_results), " rows to:\n  ", csv_path)
+message("Figures saved to:\n  ", fig_dir)
+message("Done.")
+
+```
